@@ -1,0 +1,36 @@
+# ==========================================
+# OMNIKON - Person A: The Neural Architect
+# ==========================================
+
+# 1. Python & Environments
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+venv/
+env/
+.venv/
+
+# 2. PyTorch & Model Checkpoints
+# (Never commit heavy weights or half-baked epochs to the repo)
+*.pt
+*.pth
+*.ckpt
+
+# 3. Project Specific Data & Outputs
+# (Ignoring the heavy image datasets and generated physical maps)
+data/
+output/
+*.npy
+
+# 4. Jupyter & Colab
+# (To keep your notebook explorations from creating messy checkpoint files)
+.ipynb_checkpoints/
+
+# 5. OS & IDE Clutter
+# (Keeps your Windows environment and editors from polluting the shared workspace)
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+.DS_Store
