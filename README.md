@@ -63,13 +63,13 @@ cd <your-repo-name>
 pip install torch torchvision opencv-python numpy scikit-learn pandas Pillow
 ```
 
-### Step 2: Optical Map Extraction (Person B)
+### Step 2: Optical Map Extraction
 To generate the Defocus and Specular physical maps from your raw datasets, execute the pipeline script. Update the `REAL_DIR` and `FAKE_DIR` paths in the config block before running.
 ```bash
 python omnikon_pipeline.py
 ```
 
-### Step 3: Dataset Forging & Clustering (Person A)
+### Step 3: Dataset Forging & Clustering
 Once the data is pre-processed, use the topological mapper to partition the spatial vectors and construct a balanced dataset split (Train/CV/Test).
 ```bash
 python dataset_forge.py
