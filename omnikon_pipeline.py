@@ -9,155 +9,123 @@
 #      OUTPUT_DIR/real/defocus/*.npy
 #      OUTPUT_DIR/real/specular/*.npy
 #      OUTPUT_DIR/fake/... (same structure)
+# The Transmuted Physics Pipeline (CPU & GPU Duality)
+
 import cv2
 import numpy as np
-from pathlib import Path
-import pandas as pd 
-# ---------------- GLOBAL CONFIG (edit ONLY this block) ----------------
-IMG_SIZE    = 299                     # target size for all images (matches Xception input)
-REAL_DIR    = "/content/data/real"    # <-- change this when dataset changes
-FAKE_DIR    = "/content/data/fake"    # <-- change this when dataset changes
-OUTPUT_DIR  = "/content/output"       # where processed data goes
-NUM_SAMPLES = 1200                    # images per class to use (subset for hackathon speed)
-SIGMA1      = 1.5                     # defocus blur scale 1 (paper-validated best config)
-SIGMA2      = 2.0                     # defocus blur scale 2 (paper-validated best config)
-F0_REAL     = 0.04                    # reference base reflectance for real skin
-VALID_EXTS  = (".png", ".jpg", ".jpeg")
-# ------------------------------------------------------------------------
+import torch
+import torch.nn.functional as F
+import torchvision.transforms.functional as TF
 
+# ---------------- GLOBAL CONFIG ----------------
+SIGMA1  = 1.5                     # defocus blur scale 1 
+SIGMA2  = 2.0                     # defocus blur scale 2 
+F0_REAL = 0.04                    # reference base reflectance 
+EPS     = 1e-6
+# -----------------------------------------------
 
-def list_images(folder, limit):
-    """Grab up to `limit` image files from a folder. Works regardless of
-    how the dataset is organized internally, as long as images sit
-    directly in this folder."""
-    folder = Path(folder)
-    files = [f for f in folder.iterdir() if f.suffix.lower() in VALID_EXTS]
-    return sorted(files)[:limit]
+# =====================================================================
+# I. THE LAPTOP CRUCIBLE (Sequential CPU / OpenCV)
+# =====================================================================
 
-
-def load_and_resize(path, size=IMG_SIZE):
-    img = cv2.imread(str(path))
-    if img is None:
-        return None
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(img, (size, size), interpolation=cv2.INTER_LANCZOS4)
-    return img
-
-
-# ---------------- DEFOCUS MAP (Zhuo & Sim, edge-based) ----------------
-def compute_defocus_map(gray, sigma1=SIGMA1, sigma2=SIGMA2, eps=1e-6):
-    """Returns a 0-1 normalized per-pixel blur intensity map.
-    Higher values = more blur at that pixel."""
+def compute_defocus_cpu(gray, sigma1=SIGMA1, sigma2=SIGMA2):
+    """Executes Zhuo & Sim's edge-based defocus on the CPU."""
     gray = gray.astype(np.float32) / 255.0
-
     blur1 = cv2.GaussianBlur(gray, (0, 0), sigma1)
     blur2 = cv2.GaussianBlur(gray, (0, 0), sigma2)
 
-    gx1 = cv2.Sobel(blur1, cv2.CV_32F, 1, 0, ksize=3)
-    gy1 = cv2.Sobel(blur1, cv2.CV_32F, 0, 1, ksize=3)
-    grad1 = np.sqrt(gx1 ** 2 + gy1 ** 2)
+    gx1, gy1 = cv2.Sobel(blur1, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(blur1, cv2.CV_32F, 0, 1, ksize=3)
+    gx2, gy2 = cv2.Sobel(blur2, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(blur2, cv2.CV_32F, 0, 1, ksize=3)
+    
+    grad1 = np.sqrt(gx1**2 + gy1**2)
+    grad2 = np.sqrt(gx2**2 + gy2**2)
 
-    gx2 = cv2.Sobel(blur2, cv2.CV_32F, 1, 0, ksize=3)
-    gy2 = cv2.Sobel(blur2, cv2.CV_32F, 0, 1, ksize=3)
-    grad2 = np.sqrt(gx2 ** 2 + gy2 ** 2)
-
-    R = grad1 / (grad2 + eps)
-    inside = (R ** 2 * sigma1 ** 2 - sigma2 ** 2) / (1 - R ** 2 + eps)
-    inside = np.clip(inside, 0, None)
+    R = grad1 / (grad2 + EPS)
+    inside = np.clip((R**2 * sigma1**2 - sigma2**2) / (1 - R**2 + EPS), 0, None)
     sigma_map = np.sqrt(inside)
+    return (sigma_map / sigma_map.max()).astype(np.float32) if sigma_map.max() > 0 else sigma_map
 
-    if sigma_map.max() > 0:
-        sigma_map = sigma_map / sigma_map.max()
-    return sigma_map.astype(np.float32)
-
-
-# ---------------- SPECULAR MAP (simplified GGX / Schlick) ----------------
-def compute_specular_map(gray, F0=F0_REAL, eps=1e-6):
-    """Returns a 0-1 normalized per-pixel specular reflectance score.
-    This is a simplified, hackathon-speed approximation of the full
-    microfacet model (assumes a fixed frontal light/view direction —
-    a known simplification, mention this in your pitch)."""
+def compute_specular_cpu(gray, F0=F0_REAL):
+    """Calculates GGX specular microfacet response on the CPU."""
     gray = gray.astype(np.float32) / 255.0
+    gx, gy = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    
+    nz = 1.0 / np.sqrt(gx**2 + gy**2 + 1.0)
+    nx, ny = -gx * nz, -gy * nz
 
-    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-
-    # approximate surface normal from gradients
-    nz = 1.0 / np.sqrt(gx ** 2 + gy ** 2 + 1.0)
-    nx = -gx * nz
-    ny = -gy * nz
-
-    # fixed frontal light + view direction (simplification)
-    V = np.array([0.0, 0.0, 1.0])
-    L = np.array([0.0, 0.0, 1.0])
-    H = (V + L) / (np.linalg.norm(V + L) + eps)
-
+    V = L = np.array([0.0, 0.0, 1.0])
+    H = (V + L) / (np.linalg.norm(V + L) + EPS)
     NdotH = nx * H[0] + ny * H[1] + nz * H[2]
-    NdotV = np.clip(nz, eps, 1.0)
+    NdotV = np.clip(nz, EPS, 1.0)
 
-    # roughness proxy from local gradient covariance
-    gxx = cv2.GaussianBlur(gx * gx, (0, 0), 1.0)
-    gyy = cv2.GaussianBlur(gy * gy, (0, 0), 1.0)
-    gxy = cv2.GaussianBlur(gx * gy, (0, 0), 1.0)
+    gxx, gyy, gxy = cv2.GaussianBlur(gx*gx, (0,0), 1.0), cv2.GaussianBlur(gy*gy, (0,0), 1.0), cv2.GaussianBlur(gx*gy, (0,0), 1.0)
     trace = gxx + gyy
-    det = gxx * gyy - gxy ** 2
-    disc = np.sqrt(np.clip((trace / 2) ** 2 - det, 0, None))
-    lam1 = trace / 2 + disc
-    lam2 = trace / 2 - disc
-    alpha = np.clip(np.sqrt(lam1) / (np.sqrt(lam2) + eps), 0.01, 5.0)
+    disc = np.sqrt(np.clip((trace / 2)**2 - (gxx*gyy - gxy**2), 0, None))
+    alpha = np.clip(np.sqrt(trace / 2 + disc) / (np.sqrt(np.clip(trace / 2 - disc, 0, None)) + EPS), 0.01, 5.0)
 
-    # GGX distribution D
-    denom = (NdotH ** 2 * (alpha ** 2 - 1) + 1)
-    D = (alpha ** 2) / (np.pi * denom ** 2 + eps)
+    D = (alpha**2) / (np.pi * (NdotH**2 * (alpha**2 - 1) + 1)**2 + EPS)
+    G = (2 * NdotV) / (NdotV + np.sqrt(alpha**2 + (1 - alpha**2) * NdotV**2) + EPS)
+    F = F0 + (1 - F0) * (1 - NdotH)**5
 
-    # Smith geometric attenuation G (simplified)
-    G = (2 * NdotV) / (NdotV + np.sqrt(alpha ** 2 + (1 - alpha ** 2) * NdotV ** 2) + eps)
+    s = (D * G * F) / (NdotV + EPS)
+    return (s / s.max()).astype(np.float32) if s.max() > 0 else s
 
-    # Schlick Fresnel approximation F
-    F = F0 + (1 - F0) * (1 - NdotH) ** 5
+# =====================================================================
+# II. THE WORKSTATION ORCHESTRA (Batched GPU / PyTorch)
+# =====================================================================
 
-    s = (D * G * F) / (NdotV + eps)
-    if s.max() > 0:
-        s = s / s.max()
-    return s.astype(np.float32)
+def get_sobel_kernels(device):
+    kx = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], device=device).view(1, 1, 3, 3)
+    ky = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]], device=device).view(1, 1, 3, 3)
+    return kx, ky
 
+def compute_defocus_gpu(gray_batch, sigma1=SIGMA1, sigma2=SIGMA2):
+    """Executes macro-optics across an entire batch natively on the GPU."""
+    device = gray_batch.device
+    kx, ky = get_sobel_kernels(device)
+    
+    blur1 = TF.gaussian_blur(gray_batch, kernel_size=[7, 7], sigma=[sigma1, sigma1])
+    blur2 = TF.gaussian_blur(gray_batch, kernel_size=[9, 9], sigma=[sigma2, sigma2])
+    
+    gx1, gy1 = F.conv2d(blur1, kx, padding=1), F.conv2d(blur1, ky, padding=1)
+    gx2, gy2 = F.conv2d(blur2, kx, padding=1), F.conv2d(blur2, ky, padding=1)
+    
+    grad1, grad2 = torch.sqrt(gx1**2 + gy1**2), torch.sqrt(gx2**2 + gy2**2)
+    R = grad1 / (grad2 + EPS)
+    
+    inside = torch.clamp((R**2 * sigma1**2 - sigma2**2) / (1 - R**2 + EPS), min=0)
+    sigma_map = torch.sqrt(inside)
+    
+    batch_max = sigma_map.view(sigma_map.size(0), -1).max(dim=1)[0].view(-1, 1, 1, 1) + EPS
+    return sigma_map / batch_max
 
-# ---------------- MAIN PIPELINE ----------------
-def process_class(folder, label, limit):
-    files = list_images(folder, limit)
-    print(f"[{label}] found {len(files)} images in {folder}")
-
-    out_img_dir = Path(OUTPUT_DIR) / label / "rgb"
-    out_defocus_dir = Path(OUTPUT_DIR) / label / "defocus"
-    out_specular_dir = Path(OUTPUT_DIR) / label / "specular"
-    for d in (out_img_dir, out_defocus_dir, out_specular_dir):
-        d.mkdir(parents=True, exist_ok=True)
-
-    for i, f in enumerate(files):
-        img = load_and_resize(f)
-        if img is None:
-            print(f"  skipped unreadable file: {f}")
-            continue
-
-        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-        defocus = compute_defocus_map(gray)
-        specular = compute_specular_map(gray)
-
-        name = f"{label}_{i:05d}"
-        cv2.imwrite(str(out_img_dir / f"{name}.png"), cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
-        np.save(out_defocus_dir / f"{name}.npy", defocus)
-        np.save(out_specular_dir / f"{name}.npy", specular)
-
-        if i % 100 == 0:
-            print(f"  processed {i}/{len(files)}")
-
-    print(f"[{label}] done — {len(files)} images processed.\n")
-
-
-if __name__ == "__main__":
-    process_class(REAL_DIR, "real", NUM_SAMPLES)
-    process_class(FAKE_DIR, "fake", NUM_SAMPLES)
-    print("All done! Check:", OUTPUT_DIR)
-
-
-
+def compute_specular_gpu(gray_batch, F0=F0_REAL):
+    """Executes GGX micro-optics across an entire batch natively on the GPU."""
+    device = gray_batch.device
+    kx, ky = get_sobel_kernels(device)
+    
+    gx, gy = F.conv2d(gray_batch, kx, padding=1), F.conv2d(gray_batch, ky, padding=1)
+    nz = 1.0 / torch.sqrt(gx**2 + gy**2 + 1.0)
+    nx, ny = -gx * nz, -gy * nz
+    
+    V = L = torch.tensor([0.0, 0.0, 1.0], device=device)
+    H = (V + L) / (torch.norm(V + L) + EPS)
+    NdotH = nx * H[0] + ny * H[1] + nz * H[2]
+    NdotV = torch.clamp(nz, min=EPS, max=1.0)
+    
+    gxx, gyy, gxy = gx*gx, gy*gy, gx*gy
+    gxx = TF.gaussian_blur(gxx, kernel_size=[5, 5], sigma=[1.0, 1.0])
+    gyy = TF.gaussian_blur(gyy, kernel_size=[5, 5], sigma=[1.0, 1.0])
+    gxy = TF.gaussian_blur(gxy, kernel_size=[5, 5], sigma=[1.0, 1.0])
+    
+    trace = gxx + gyy
+    disc = torch.sqrt(torch.clamp((trace / 2)**2 - (gxx*gyy - gxy**2), min=0))
+    alpha = torch.clamp(torch.sqrt(trace / 2 + disc) / (torch.sqrt(torch.clamp(trace / 2 - disc, min=0)) + EPS), min=0.01, max=5.0)
+    
+    D = (alpha**2) / (torch.pi * (NdotH**2 * (alpha**2 - 1) + 1)**2 + EPS)
+    G = (2 * NdotV) / (NdotV + torch.sqrt(alpha**2 + (1 - alpha**2) * NdotV**2) + EPS)
+    F_fresnel = F0 + (1 - F0) * (1 - NdotH)**5
+    
+    s = (D * G * F_fresnel) / (NdotV + EPS)
+    batch_max = s.view(s.size(0), -1).max(dim=1)[0].view(-1, 1, 1, 1) + EPS
+    return s / batch_max
