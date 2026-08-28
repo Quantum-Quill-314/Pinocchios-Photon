@@ -11,7 +11,7 @@ class VisualStream(nn.Module):
         super().__init__()
         self.verbose = verbose
         # Pre-trained Backbone to extract rich semantic features
-        resnet = models.resnet18(pretrained=True)
+        resnet = models.resnet18(weights='IMAGENET1K_V1')
         self.backbone = nn.Sequential(*list(resnet.children())[:-2])
         self.adaptive_pool = nn.AdaptiveAvgPool2d((1, 1))
         
@@ -105,7 +105,7 @@ if __name__ == "__main__":
     print("Initializing Omnikon Detector Test Forge...")
     
     # Initialize the model with verbose logging enabled
-    model = Dectector(verbose=True)
+    model = Dectector(verbose=False)
     
     # Generate dummy tensors matching the config specifications
     # Using batch size of 2 for testing to ensure dimension handling is correct

@@ -1,5 +1,5 @@
 # dataset_forge.py
-# The Omnikon Dataset Architect
+# The GPU-Accelerated Omnikon Dataset Architect
 
 import os
 import shutil
@@ -11,27 +11,55 @@ import torchvision.transforms as transforms
 from PIL import Image
 from sklearn.cluster import MiniBatchKMeans
 from pathlib import Path
+from torch.utils.data import Dataset, DataLoader
 
 # =====================================================================
 # GLOBAL CONFIGURATION: THE COMMAND CENTER
 # =====================================================================
-# Direct these paths to where you are extracting the .zip files
-REAL_SOURCE_DIR = "/home/mystical-poet/WhisperShade/Codes/Omnikon/DATASET/REAL"  
-FAKE_SOURCE_DIR = "/home/mystical-poet/WhisperShade/Codes/Omnikon/DATASET/FAKE"
+# Temporary extraction zones
+TEMP_REAL_DIR = "/home/mystical-poet/WhisperShade/Codes/Omnikon/DATASET/real_temp"  
+TEMP_FAKE_DIR = "/home/mystical-poet/WhisperShade/Codes/Omnikon/DATASET/fake_temp"
 
-# The final destination for the structurally balanced splits.
-DATASET_ROOT = "/home/mystical-poet/WhisperShade/Codes/Omnikon/DATASET"
+# Final Migration Endpoints for Real Data
+TRAIN_REAL_DIR = "/home/mystical-poet/WhisperShade/Codes/Omnikon/DATASET/train/REAL"
+CV_REAL_DIR = "/home/mystical-poet/WhisperShade/Codes/Omnikon/DATASET/cv/REAL"
+TEST_REAL_DIR = "/home/mystical-poet/WhisperShade/Codes/Omnikon/DATASET/test/REAL"
+
+# Final Migration Endpoints for Fake Data
+TRAIN_FAKE_DIR = "/home/mystical-poet/WhisperShade/Codes/Omnikon/DATASET/train/FAKE"
+CV_FAKE_DIR = "/home/mystical-poet/WhisperShade/Codes/Omnikon/DATASET/cv/FAKE"
+TEST_FAKE_DIR = "/home/mystical-poet/WhisperShade/Codes/Omnikon/DATASET/test/FAKE"
 
 # Target Quotas
-REAL_QUOTA = 100
-FAKE_QUOTA = 100
-NUM_CLUSTERS = 5 # The number of geometric regions to define
+REAL_QUOTA = 50000
+FAKE_QUOTA = 47000
+NUM_CLUSTERS = 50 # The number of geometric regions to define
 
 # Data split ratios (60:20:20)
 TRAIN_RATIO = 0.6
 CV_RATIO = 0.2
 TEST_RATIO = 0.2
+BATCH_SIZE = 256
 # =====================================================================
+
+class FastImageDataset(Dataset):
+    """Pipes images into the GPU without stalling the CUDA cores."""
+    def __init__(self, image_paths, transform):
+        self.image_paths = image_paths
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        path = self.image_paths[idx]
+        try:
+            img = Image.open(path).convert('RGB')
+            tensor = self.transform(img)
+            return tensor, str(path)
+        except Exception:
+            # Return an empty tensor if the image is violently corrupted
+            return torch.zeros(3, 224, 224), ""
 
 def extract_features_and_cluster(image_dir, quota):
     print(f"\n[Oracle] Initiating topological mapping for {image_dir}...")
@@ -40,11 +68,10 @@ def extract_features_and_cluster(image_dir, quota):
     weights = models.ResNet18_Weights.IMAGENET1K_V1
     model = models.resnet18(weights=weights)
     model = torch.nn.Sequential(*list(model.children())[:-1]) # Strip classification head
-    model.eval()
     
-    # Check for hardware acceleration
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
+    model.eval()
     
     preprocess = transforms.Compose([
         transforms.Resize(256),
@@ -60,22 +87,34 @@ def extract_features_and_cluster(image_dir, quota):
 
     print(f"[Oracle] Extracting 512-D geometric vectors for {len(image_paths)} images...")
     
+    dataset = FastImageDataset(image_paths, preprocess)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=8, pin_memory=True)
+    
     features = []
     valid_paths = []
     
     with torch.no_grad():
-        for i, path in enumerate(image_paths):
-            try:
-                img = Image.open(path).convert('RGB')
-                tensor = preprocess(img).unsqueeze(0).to(device)
-                vec = model(tensor).squeeze().cpu().numpy()
-                features.append(vec)
-                valid_paths.append(path)
-            except Exception as e:
+        for batch_idx, (tensors, paths) in enumerate(dataloader):
+            # Filter out any corrupted image paths safely
+            valid_mask = [p != "" for p in paths]
+            if not any(valid_mask):
                 continue
+                
+            clean_tensors = tensors[[i for i, m in enumerate(valid_mask) if m]].to(device, non_blocking=True)
+            clean_paths = [p for p in paths if p != ""]
             
-            if (i+1) % 5000 == 0:
-                print(f"  Mapped {i+1} images...")
+            vecs = model(clean_tensors).squeeze().cpu().numpy()
+            
+            # Handle single-image batch dimension collapse
+            if len(clean_paths) == 1:
+                vecs = np.expand_dims(vecs, axis=0)
+                
+            features.extend(vecs)
+            valid_paths.extend(clean_paths)
+            
+            processed = (batch_idx + 1) * BATCH_SIZE
+            if processed % 5000 < BATCH_SIZE:
+                print(f"  Mapped {min(processed, len(image_paths))} images...")
                 
     features = np.array(features)
     print(f"[Oracle] Mapping complete. Feature matrix shape: {features.shape}")
@@ -107,34 +146,35 @@ def extract_features_and_cluster(image_dir, quota):
     random.shuffle(selected_paths)
     return selected_paths
 
-def construct_and_populate(selected_paths, category_name):
-    print(f"\n[Architect] Constructing final repositories for {category_name}...")
+def construct_and_populate(selected_paths, train_dir, cv_dir, test_dir):
+    print(f"\n[Architect] Constructing final repositories and routing files...")
     
     total = len(selected_paths)
     train_split = int(total * TRAIN_RATIO)
     cv_split = int(total * CV_RATIO)
     
     splits = {
-        'train': selected_paths[:train_split],
-        'cv': selected_paths[train_split:train_split + cv_split],
-        'test': selected_paths[train_split + cv_split:]
+        train_dir: selected_paths[:train_split],
+        cv_dir: selected_paths[train_split:train_split + cv_split],
+        test_dir: selected_paths[train_split + cv_split:]
     }
     
-    for split_name, paths in splits.items():
-        dest_dir = Path(DATASET_ROOT) / split_name / category_name
-        dest_dir.mkdir(parents=True, exist_ok=True)
+    for dest_dir, paths in splits.items():
+        dest_path = Path(dest_dir)
+        dest_path.mkdir(parents=True, exist_ok=True)
         
-        print(f"  Migrating {len(paths)} images to {dest_dir}...")
+        print(f"  Migrating {len(paths)} images to {dest_path}...")
         for path in paths:
-            shutil.copy2(path, dest_dir / path.name)
+            # We enforce absolute string conversion to avoid Pathlib collision errors
+            shutil.copy2(str(path), dest_path / Path(path).name)
 
 if __name__ == "__main__":
     print("=== OMNIKON DATASET FORGE INITIATED ===")
     
-    real_subset = extract_features_and_cluster(REAL_SOURCE_DIR, REAL_QUOTA)
-    construct_and_populate(real_subset, "real")
+    real_subset = extract_features_and_cluster(TEMP_REAL_DIR, REAL_QUOTA)
+    construct_and_populate(real_subset, TRAIN_REAL_DIR, CV_REAL_DIR, TEST_REAL_DIR)
     
-    fake_subset = extract_features_and_cluster(FAKE_SOURCE_DIR, FAKE_QUOTA)
-    construct_and_populate(fake_subset, "fake")
+    fake_subset = extract_features_and_cluster(TEMP_FAKE_DIR, FAKE_QUOTA)
+    construct_and_populate(fake_subset, TRAIN_FAKE_DIR, CV_FAKE_DIR, TEST_FAKE_DIR)
     
     print("\n=== FORGE COMPLETE. The Omnikon dataset is primed. ===")
