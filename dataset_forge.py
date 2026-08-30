@@ -18,7 +18,8 @@ from torch.utils.data import Dataset, DataLoader
 # =====================================================================
 # Temporary extraction zones
 TEMP_REAL_DIR = "/home/mystical-poet/WhisperShade/Codes/Omnikon/DATASET/real_temp"  
-TEMP_FAKE_DIR = "/home/mystical-poet/WhisperShade/Codes/Omnikon/DATASET/fake_temp"
+TEMP_FAKE_GAN_DIR = "/home/mystical-poet/WhisperShade/Codes/Omnikon/DATASET/fake_gan_temp"
+TEMP_FAKE_DIFF_DIR = "/home/mystical-poet/WhisperShade/Codes/Omnikon/DATASET/fake_diff_temp"
 
 # Final Migration Endpoints for Real Data
 TRAIN_REAL_DIR = "/home/mystical-poet/WhisperShade/Codes/Omnikon/DATASET/train/REAL"
@@ -32,7 +33,8 @@ TEST_FAKE_DIR = "/home/mystical-poet/WhisperShade/Codes/Omnikon/DATASET/test/FAK
 
 # Target Quotas
 REAL_QUOTA = 50000
-FAKE_QUOTA = 47000
+FAKE_GAN_QUOTA = 25000
+FAKE_DIFF_QUOTA = 25000
 NUM_CLUSTERS = 50 # The number of geometric regions to define
 
 # Data split ratios (60:20:20)
@@ -171,10 +173,20 @@ def construct_and_populate(selected_paths, train_dir, cv_dir, test_dir):
 if __name__ == "__main__":
     print("=== OMNIKON DATASET FORGE INITIATED ===")
     
+    # 1. Harvest Real Data
     real_subset = extract_features_and_cluster(TEMP_REAL_DIR, REAL_QUOTA)
     construct_and_populate(real_subset, TRAIN_REAL_DIR, CV_REAL_DIR, TEST_REAL_DIR)
     
-    fake_subset = extract_features_and_cluster(TEMP_FAKE_DIR, FAKE_QUOTA)
-    construct_and_populate(fake_subset, TRAIN_FAKE_DIR, CV_FAKE_DIR, TEST_FAKE_DIR)
+    # 2. Harvest Synthetic Data Streams
+    fake_gan_subset = extract_features_and_cluster(TEMP_FAKE_GAN_DIR, FAKE_GAN_QUOTA)
+    fake_diff_subset = extract_features_and_cluster(TEMP_FAKE_DIFF_DIR, FAKE_DIFF_QUOTA)
+    
+    # 3. Merge and Shuffle the Fakes
+    print("\n[Architect] Merging GAN and Diffusion artifacts into a unified synthetic distribution...")
+    unified_fake_subset = fake_gan_subset + fake_diff_subset
+    random.shuffle(unified_fake_subset)
+    
+    # 4. Populate Unified Fake Repositories
+    construct_and_populate(unified_fake_subset, TRAIN_FAKE_DIR, CV_FAKE_DIR, TEST_FAKE_DIR)
     
     print("\n=== FORGE COMPLETE. The Omnikon dataset is primed. ===")
