@@ -12,6 +12,7 @@ from torchvision import transforms
 from PIL import Image
 import numpy as np
 import cv2
+from sklearn.metrics import roc_auc_score
 
 # Import your architectural components
 from dual_branch_net import Dectector
@@ -28,6 +29,8 @@ LEARNING_RATE = 3e-4
 PATIENCE      = 15      # Epochs to wait for CV loss improvement before aborting
 MAX_EPOCHS    = 50
 IMG_SIZE      = 299
+FREEZE_EPOCHS = 8
+AUX_WEIGHT = 0.5
 # =====================================================================
 
 class OmnikonDataset(Dataset):
@@ -106,8 +109,17 @@ def main():
     # --- Interactive Prologue ---
     start_epoch = 1
     model = Dectector(verbose=False).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
-    
+    # Differential Learning Rates
+    optimizer = optim.AdamW([
+        {'params': model.visual_stream.parameters(), 'lr': 1e-5}, # Microscopic LR for ResNet
+        {'params': model.physics_stream.parameters(), 'lr': LEARNING_RATE},
+        {'params': model.phys_mlp.parameters(), 'lr': LEARNING_RATE},
+        {'params': [model.alpha], 'lr': LEARNING_RATE},
+        {'params': model.fc1.parameters(), 'lr': LEARNING_RATE},
+        {'params': model.bn2.parameters(), 'lr': LEARNING_RATE},
+        {'params': model.fc2.parameters(), 'lr': LEARNING_RATE},
+        {'params': model.aux_head.parameters(), 'lr': LEARNING_RATE}
+])    
     run_saved = input("[?] Resurrect a saved state? (y/n): ").strip().lower()
     if run_saved == 'y':
         path = input("[?] Enter the exact path to the .pth file: ").strip()
@@ -152,9 +164,20 @@ def main():
         for epoch in range(start_epoch, target_epochs + 1):
             print(f"\n--- Epoch {epoch}/{target_epochs} ---")
             
+            # Temporal Cryostasis
+            if epoch <= FREEZE_EPOCHS:
+                for param in model.visual_stream.parameters():
+                    param.requires_grad = False
+                print(f"  [Sentry] Visual Stream frozen (Epoch {epoch}/{FREEZE_EPOCHS})")
+            else:
+                for param in model.visual_stream.parameters():
+                    param.requires_grad = True
+                    
             # Phase I: Training
             model.train()
             train_loss = 0.0
+            all_train_labels, all_train_preds = [], []
+            
             for rgb, phys_or_gray, labels in train_loader:
                 rgb, labels = rgb.to(device, non_blocking=True), labels.to(device, non_blocking=True)
                 phys_or_gray = phys_or_gray.to(device, non_blocking=True)
@@ -167,19 +190,30 @@ def main():
                     phys = phys_or_gray
                 
                 optimizer.zero_grad()
-                outputs = model(rgb, phys)
-                loss = criterion(outputs, labels)
+                main_prob, aux_prob = model(rgb, phys)
+                
+                # The Auxiliary Anchor Loss
+                loss_main = criterion(main_prob, labels)
+                loss_aux = criterion(aux_prob, labels)
+                loss = loss_main + AUX_WEIGHT * loss_aux
+                
                 loss.backward()
                 optimizer.step()
                 train_loss += loss.item()
                 
+                all_train_labels.extend(labels.cpu().numpy())
+                all_train_preds.extend(main_prob.detach().cpu().numpy())
+                
             avg_train_loss = train_loss / len(train_loader)
+            train_auc = roc_auc_score(all_train_labels, all_train_preds)
             writer.add_scalar('Loss/Train', avg_train_loss, epoch)
-            print(f"  Training Loss: {avg_train_loss:.4f}")
+            writer.add_scalar('AUC/Train', train_auc, epoch)
+            print(f"  Training Loss: {avg_train_loss:.4f} | AUC: {train_auc:.4f}")
 
             # Phase II: Cross-Validation
             model.eval()
             cv_loss = 0.0
+            all_cv_labels, all_cv_preds = [], []
             with torch.no_grad():
                 for rgb, phys_or_gray, labels in cv_loader:
                     rgb, labels = rgb.to(device, non_blocking=True), labels.to(device, non_blocking=True)
@@ -192,15 +226,24 @@ def main():
                     else:
                         phys = phys_or_gray
                         
-                    outputs = model(rgb, phys)
-                    cv_loss += criterion(outputs, labels).item()
+                    main_prob, aux_prob = model(rgb, phys)
+                    loss_main = criterion(main_prob, labels)
+                    loss_aux = criterion(aux_prob, labels)
+                    loss = loss_main + AUX_WEIGHT * loss_aux
+                    
+                    cv_loss += loss.item()
+                    all_cv_labels.extend(labels.cpu().numpy())
+                    all_cv_preds.extend(main_prob.cpu().numpy())
                     
             avg_cv_loss = cv_loss / len(cv_loader)
+            cv_auc = roc_auc_score(all_cv_labels, all_cv_preds)
             writer.add_scalar('Loss/CV', avg_cv_loss, epoch)
-            print(f"  CV Loss:       {avg_cv_loss:.4f}")
+            writer.add_scalar('AUC/CV', cv_auc, epoch)
+            print(f"  CV Loss:       {avg_cv_loss:.4f} | AUC: {cv_auc:.4f}")
 
             # Phase III: Testing
             test_loss = 0.0
+            all_test_labels, all_test_preds = [], []
             with torch.no_grad():
                 for rgb, phys_or_gray, labels in test_loader:
                     rgb, labels = rgb.to(device, non_blocking=True), labels.to(device, non_blocking=True)
@@ -213,12 +256,20 @@ def main():
                     else:
                         phys = phys_or_gray
                         
-                    outputs = model(rgb, phys)
-                    test_loss += criterion(outputs, labels).item()
+                    main_prob, aux_prob = model(rgb, phys)
+                    loss_main = criterion(main_prob, labels)
+                    loss_aux = criterion(aux_prob, labels)
+                    loss = loss_main + AUX_WEIGHT * loss_aux
+                    
+                    test_loss += loss.item()
+                    all_test_labels.extend(labels.cpu().numpy())
+                    all_test_preds.extend(main_prob.cpu().numpy())
                     
             avg_test_loss = test_loss / len(test_loader)
+            test_auc = roc_auc_score(all_test_labels, all_test_preds)
             writer.add_scalar('Loss/Test', avg_test_loss, epoch)
-            print(f"  Test Loss:     {avg_test_loss:.4f}")
+            writer.add_scalar('AUC/Test', test_auc, epoch)
+            print(f"  Test Loss:     {avg_test_loss:.4f} | AUC: {test_auc:.4f}")
 
             # Sentry: Early Stopping Check
             if avg_cv_loss < best_cv_loss:
