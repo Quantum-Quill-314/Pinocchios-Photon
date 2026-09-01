@@ -35,6 +35,7 @@ To maintain computational feasibility and scale within the strict time constrain
 
 *   **Authentic (Real) Data:** The genuine human baseline is sourced from the **Flickr-Faces** dataset (via Kaggle). This provides a rich diversity of natural lighting conditions, skin textures, and genuine microfacet reflectance profiles.
 *   **Synthetic (Fake) Data:** The manipulated samples are exclusively sourced from the **SFHQ Dataset Part 1** (via Kaggle). Constraining the synthetic data to this subset allows for a focused and rapid training phase for our dual-branch architecture without compromising the integrity of the physics extraction.
+*   **Sample Test Data (Real and Fake):** The real image were scraped from the internet, while the fake images were generated from Gemini and GPT.  
 
 ### 🚀 Future Scope: Architectural Agnosticism
 While the current prototype focuses on the SFHQ dataset for feasibility, the ultimate vision of the Pinocchio's Photon  platform is to be entirely agnostic to the generator's origin. Future iterations will significantly scale the training pipeline to ingest fake images forged by a wide variety of Generative AI architectures—including diverse Generative Adversarial Networks (GANs), advanced Latent Diffusion Models, and auto-regressive synthesizers. By exposing the network to a broader spectrum of synthesis techniques, the physics-veto mechanism will become robust against the ever-evolving landscape of digital deception.
